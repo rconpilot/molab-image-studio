@@ -138,13 +138,39 @@ pipe = None
 
 def _load_flux():
     global pipe, BACKEND
-    # Path A: one-download merged bundle (FLUX.1-dev with the uncensored LoRA baked in)
+    # Path A: merged bundle, loaded component-by-component straight onto the
+    # GPU. (A plain FluxPipeline.from_pretrained + .to("cuda") dies on this
+    # bundle with "Cannot copy out of meta tensor" under current diffusers —
+    # the bundle itself is a standard FLUX layout, verified file by file.)
     try:
-        log("⬇ image model: downloading/loading shauray/FLUX-UNCENSORED-merged (one-time, ~34 GB) …")
+        log("⬇ image model: downloading shauray/FLUX-UNCENSORED-merged (one-time, ~32 GB) …")
         _t = time.time()
-        p = FluxPipeline.from_pretrained("shauray/FLUX-UNCENSORED-merged",
-                                         dtype=torch.bfloat16)
-        p = p.to("cuda")
+        from huggingface_hub import snapshot_download
+        from diffusers import (FluxTransformer2DModel, AutoencoderKL,
+                               FlowMatchEulerDiscreteScheduler)
+        from transformers import (CLIPTextModel, CLIPTokenizer,
+                                  T5EncoderModel, T5TokenizerFast)
+        snap = snapshot_download("shauray/FLUX-UNCENSORED-merged")
+        log("snapshot:", snap)
+
+        def comp(cls, sub, dtype=torch.bfloat16):
+            m = cls.from_pretrained(os.path.join(snap, sub), dtype=dtype,
+                                    low_cpu_mem_usage=False)
+            m = m.to("cuda")
+            log(f"  ✔ {sub} on GPU — {vram()}")
+            return m
+
+        transformer = comp(FluxTransformer2DModel, "transformer")
+        text_encoder = comp(CLIPTextModel, "text_encoder")
+        text_encoder_2 = comp(T5EncoderModel, "text_encoder_2")
+        vae = comp(AutoencoderKL, "vae", dtype=torch.float32)
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(snap, subfolder="scheduler")
+        tokenizer = CLIPTokenizer.from_pretrained(snap, subfolder="tokenizer")
+        tokenizer_2 = T5TokenizerFast.from_pretrained(snap, subfolder="tokenizer_2")
+        p = FluxPipeline(transformer=transformer, text_encoder=text_encoder,
+                         text_encoder_2=text_encoder_2, vae=vae,
+                         scheduler=scheduler, tokenizer=tokenizer,
+                         tokenizer_2=tokenizer_2)
         BACKEND = "FLUX.1-dev + Uncensored (merged bundle)"
         log(f"✔ merged bundle loaded in {time.time() - _t:.0f}s")
         return p
