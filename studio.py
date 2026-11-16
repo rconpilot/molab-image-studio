@@ -1,38 +1,51 @@
 # ============================================================
-#  Molab Image Studio — quality-ceiling build
+#  Molab Image Studio — quality-ceiling build (v2, full logging)
 #  Engine (prompt brain): Gemma 4 12B abliterated (huihui-ai), BF16
 #  Image: FLUX.1-dev + Flux-Uncensored-V2
 #         (merged bundle first; dev + LoRA as fallback)
 #  UI: Gradio — describe in Persian or English, the engine writes
 #      the FLUX prompt, you can edit it, then generate.
+#  Everything logs live under the cell: installs, downloads
+#  (a watcher prints HF-cache GB + GPU mem every 30 s), loads,
+#  and generation steps.
 # ============================================================
 
-import subprocess, sys
+import sys
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+def log(*a):
+    print(*a, flush=True)
+
+import subprocess
 
 def _pip(*pkgs):
-    for cmd in ([sys.executable, "-m", "pip", "install", "-q", "-U", *pkgs],
-                ["uv", "pip", "install", "--system", "-q", *pkgs]):
+    for cmd in ([sys.executable, "-m", "pip", "install", "-U", *pkgs],
+                ["uv", "pip", "install", "--system", *pkgs]):
+        log(">>> running:", " ".join(cmd))
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            r = subprocess.run(cmd, timeout=1800)  # streams live to the cell
             if r.returncode == 0:
-                print("installed:", ", ".join(pkgs))
+                log("installed:", ", ".join(pkgs))
                 return
-            print("install attempt failed:", (r.stderr or "")[-300:])
+            log("install attempt failed with code", r.returncode)
         except Exception as e:
-            print("install attempt error:", e)
-    print("WARNING: could not install", pkgs)
+            log("install attempt error:", e)
+    log("WARNING: could not install", pkgs)
 
 _pip("diffusers", "transformers", "accelerate", "gradio", "safetensors", "sentencepiece", "protobuf")
 
-import os, random, traceback
+import os, random, threading, time
 import torch
 
-print("=" * 60)
+log("=" * 60)
 if torch.cuda.is_available():
     _p = torch.cuda.get_device_properties(0)
-    print(f"GPU: {_p.name} — {_p.total_memory / 2**30:.1f} GB VRAM")
+    log(f"GPU: {_p.name} — {_p.total_memory / 2**30:.1f} GB VRAM")
 else:
-    print("WARNING: no GPU visible!")
+    log("WARNING: no GPU visible!")
 
 def vram():
     if not torch.cuda.is_available():
@@ -40,6 +53,29 @@ def vram():
     a = torch.cuda.memory_allocated() / 2**30
     r = torch.cuda.memory_reserved() / 2**30
     return f"VRAM allocated {a:.1f} GB / reserved {r:.1f} GB"
+
+# --- progress watcher: HF cache size + GPU mem every 30 s ---
+_stop_watch = threading.Event()
+
+def _hf_cache_bytes():
+    total = 0
+    for root, dirs, files in os.walk(os.path.expanduser("~/.cache/huggingface")):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+def _watch():
+    while not _stop_watch.is_set():
+        gpu = ""
+        if torch.cuda.is_available():
+            gpu = f" — GPU mem {torch.cuda.memory_allocated() / 2**30:.1f} GB"
+        log(f"  … progress: HF cache {_hf_cache_bytes() / 2**30:.1f} GB{gpu}")
+        _stop_watch.wait(30)
+
+threading.Thread(target=_watch, daemon=True).start()
 
 # ------------------------------------------------------------
 # 1) Engine — Gemma 4 12B abliterated (uncensored prompt brain)
@@ -52,11 +88,12 @@ try:
 except Exception:
     from transformers import AutoModelForCausalLM as _AutoLLM
 
-print(f"loading engine: {GEMMA_REPO} ...")
+log(f"⬇ engine: downloading/loading {GEMMA_REPO} (one-time, ~24 GB) …")
+_t0 = time.time()
 tok = AutoTokenizer.from_pretrained(GEMMA_REPO)
 llm = _AutoLLM.from_pretrained(GEMMA_REPO, dtype=torch.bfloat16, device_map="cuda")
 llm.eval()
-print("engine loaded —", vram())
+log(f"✔ engine loaded in {time.time() - _t0:.0f}s —", vram())
 
 BRAIN_SYSTEM = (
     "You are the prompt engine of a photorealistic image studio. "
@@ -86,7 +123,6 @@ def make_prompt(description: str) -> str:
                            do_sample=False, pad_token_id=tok.eos_token_id)
     gen = out[0][ids.shape[1]:]
     text = tok.decode(gen, skip_special_tokens=True).strip()
-    # strip any stray block markers the model may add
     for marker in ("POSITIVE:", "Prompt:", "prompt:"):
         if marker in text:
             text = text.split(marker)[-1].strip()
@@ -104,15 +140,18 @@ def _load_flux():
     global pipe, BACKEND
     # Path A: one-download merged bundle (FLUX.1-dev with the uncensored LoRA baked in)
     try:
-        print("loading image model: shauray/FLUX-UNCENSORED-merged ...")
+        log("⬇ image model: downloading/loading shauray/FLUX-UNCENSORED-merged (one-time, ~34 GB) …")
+        _t = time.time()
         p = FluxPipeline.from_pretrained("shauray/FLUX-UNCENSORED-merged",
                                          dtype=torch.bfloat16)
         p = p.to("cuda")
         BACKEND = "FLUX.1-dev + Uncensored (merged bundle)"
+        log(f"✔ merged bundle loaded in {time.time() - _t:.0f}s")
         return p
     except Exception as e:
-        print("merged bundle failed, falling back to dev + LoRA:", repr(e)[:300])
+        log("merged bundle failed, falling back to dev + LoRA:", repr(e)[:300])
     # Path B: stock FLUX.1-dev + the Uncensored-V2 LoRA (needs HF token if the repo is gated)
+    log("⬇ image model: downloading/loading black-forest-labs/FLUX.1-dev + Uncensored-V2 LoRA …")
     p = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev",
                                      dtype=torch.bfloat16)
     p.load_lora_weights("enhanceaiteam/Flux-Uncensored-V2")
@@ -121,7 +160,7 @@ def _load_flux():
     return p
 
 pipe = _load_flux()
-print("image model loaded —", BACKEND, "—", vram())
+log("✔ image model loaded —", BACKEND, "—", vram())
 
 # ------------------------------------------------------------
 # 3) Generation
@@ -134,6 +173,11 @@ SIZES = {
     "768 × 1344 (tall)": (768, 1344),
 }
 
+def _step_log(pipe_, step, timestep, kwargs):
+    if step % 5 == 0:
+        log(f"  generating… step {step}")
+    return kwargs
+
 def generate(prompt, size_label, steps, guidance, lora_strength, count, seed):
     if not prompt or not prompt.strip():
         return [], "اول یه پرامپت بساز یا بنویس."
@@ -142,16 +186,18 @@ def generate(prompt, size_label, steps, guidance, lora_strength, count, seed):
         try:
             pipe.set_adapters(["default_0"], adapter_weights=[float(lora_strength)])
         except Exception as e:
-            print("set_adapters failed:", e)
+            log("set_adapters failed:", e)
     imgs = []
     base_seed = int(seed)
     for i in range(int(count)):
         s = base_seed if base_seed >= 0 else random.randint(0, 2**31 - 1)
         g = torch.Generator("cuda").manual_seed(s + i)
+        _t = time.time()
         img = pipe(prompt=prompt.strip(), width=w, height=h,
                    num_inference_steps=int(steps),
                    guidance_scale=float(guidance),
-                   generator=g).images[0]
+                   generator=g, callback_on_step_end=_step_log).images[0]
+        log(f"✔ image {i + 1} done in {time.time() - _t:.0f}s (seed {s + i})")
         imgs.append(img)
     return imgs, f"ساخته شد — seed پایه: {base_seed} — {vram()}"
 
@@ -188,5 +234,7 @@ with gr.Blocks(title="Molab Image Studio") as demo:
                   inputs=[prompt_box, size, steps, guidance, lora, count, seed],
                   outputs=[gallery, note])
 
+_stop_watch.set()
+log("✔ all models ready — launching Gradio …")
 demo.queue()
 demo.launch(share=True)
